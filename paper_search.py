@@ -24,8 +24,6 @@ from io import BytesIO
 
 # Text processing
 import tiktoken
-import nltk
-from nltk.tokenize import sent_tokenize
 
 # Pinecone
 from pinecone import Pinecone
@@ -103,19 +101,8 @@ class AdvancedPaperSearcher:
         # Initialize tokenizer untuk chunking
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
         
-        # Download NLTK data
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except LookupError:
-            logger.info("📚 Downloading NLTK data...")
-            nltk.download('punkt', quiet=True)
-        
-        # Download additional NLTK resources
-        try:
-            nltk.data.find('tokenizers/punkt_tab')
-        except LookupError:
-            logger.info("📚 Downloading NLTK punkt_tab data...")
-            nltk.download('punkt_tab', quiet=True)
+        # Simple sentence tokenizer (replaces NLTK)
+        self.sentence_endings = r'[.!?]+\s+'
         
         # Pinecone setup
         self.pinecone_client = None
@@ -142,6 +129,26 @@ class AdvancedPaperSearcher:
         }
         
         logger.info("✅ AdvancedPaperSearcher v2 initialized!")
+    
+    def simple_sent_tokenize(self, text: str) -> List[str]:
+        """Simple sentence tokenizer to replace NLTK."""
+        if not text:
+            return []
+        
+        # Split on sentence endings followed by whitespace and capital letter
+        sentences = re.split(r'[.!?]+\s+(?=[A-Z])', text)
+        
+        # Clean up sentences
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence:
+                # Add back the period if it doesn't end with punctuation
+                if not sentence[-1] in '.!?':
+                    sentence += '.'
+                cleaned_sentences.append(sentence)
+        
+        return cleaned_sentences
     
     def save_checkpoint(self, papers: List[Dict] = None, chunks: List[Dict] = None):
         """Save current progress checkpoint."""
@@ -928,7 +935,7 @@ class AdvancedPaperSearcher:
             
             # Try to break at sentence boundary
             if end < len(tokens):
-                sentences = sent_tokenize(chunk_text)
+                sentences = self.simple_sent_tokenize(chunk_text)
                 if len(sentences) > 1:
                     chunk_text = ' '.join(sentences[:-1])
             
