@@ -1,0 +1,8 @@
+/.dist
+/.env
+/.env.example
+/README.md
+/paper_search.log
+/rag_data
+/static
+/venv
