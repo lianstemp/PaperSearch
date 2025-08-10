@@ -13,14 +13,12 @@ import hashlib
 from typing import List, Dict, Optional
 import xml.etree.ElementTree as ET
 from datetime import datetime
-import concurrent.futures
 from pathlib import Path
 import logging
 
 # PDF processing
 import PyPDF2
-import fitz  # PyMuPDF
-from io import BytesIO
+from io import BytesIO  # unused
 
 # Text processing
 import tiktoken
@@ -794,6 +792,8 @@ class AdvancedPaperSearcher:
         try:
             # Method 1: PyMuPDF (fitz)
             try:
+                # Lazy import to avoid importing wrong 'fitz' package in some environments
+                import fitz  # PyMuPDF
                 doc = fitz.open(filepath)
                 text_parts = []
                 
@@ -813,7 +813,7 @@ class AdvancedPaperSearcher:
                     return full_text.strip()
                     
             except Exception as e:
-                logger.warning(f"PyMuPDF failed, trying PyPDF2: {e}")
+                logger.warning(f"PyMuPDF unavailable or failed, falling back to PyPDF2: {e}")
             
             # Method 2: PyPDF2 fallback
             with open(filepath, 'rb') as file:
@@ -873,6 +873,9 @@ class AdvancedPaperSearcher:
                 chunks = self._split_text_into_chunks(combined_text, max_tokens=512, overlap=50)
                 
                 for i, chunk in enumerate(chunks):
+                    # lightweight metadata enrichment
+                    token_count = len(self.tokenizer.encode(chunk))
+                    char_len = len(chunk)
                     chunk_data = {
                         'id': f"{paper['id']}_chunk_{i}",
                         'paper_id': paper['id'],
@@ -886,7 +889,10 @@ class AdvancedPaperSearcher:
                             'venue': paper.get('venue', ''),
                             'citation_count': paper.get('citation_count', 0),
                             'url': paper.get('url', ''),
-                            'paper_id': paper['id']
+                            'paper_id': paper['id'],
+                            'chunk_index': i,
+                            'token_count': token_count,
+                            'char_len': char_len
                         }
                     }
                     all_chunks.append(chunk_data)
@@ -1043,10 +1049,10 @@ class AdvancedPaperSearcher:
                         logger.warning(f"⚠️ Skipping invalid chunk at index {i}: {type(chunk)}")
                         continue
                         
-                    # For Pinecone built-in embedding, use the data format expected by the embedding model
+                    # For Pinecone built-in embedding, use field_map to map model 'text' -> our 'chunk_text'
                     record = {
                         'id': chunk['id'],
-                        'chunk_text': chunk['chunk_text'],  # This matches the field_map configuration
+                        'chunk_text': chunk['chunk_text'],  # server-side will map this to model input 'text'
                         'metadata': chunk['metadata']
                     }
                     records.append(record)
@@ -1054,67 +1060,70 @@ class AdvancedPaperSearcher:
                 # Upload batch - try multiple approaches
                 if records:
                     logger.info(f"📤 Uploading batch {batch_idx + 1}/{end_batch} ({len(records)} records)...")
-                    
-                    # Method 1: Try using Pinecone's inference API for embedding
+
+                    # Method 1: Server-side embedding via records + field_map
                     try:
-                        # Extract texts for embedding
-                        texts = [record['chunk_text'] for record in records]
-                        
-                        # Generate embeddings using Pinecone's inference API
-                        embeddings_response = self.pinecone_client.inference.embed(
-                            model="llama-text-embed-v2",
-                            inputs=texts,
-                            parameters={"input_type": "passage"}
-                        )
-                        
-                        # Prepare vectors with embeddings
-                        vectors = []
-                        for i, record in enumerate(records):
-                            vector = {
-                                'id': record['id'],
-                                'values': embeddings_response.data[i].values,
-                                'metadata': record['metadata']
-                            }
-                            vectors.append(vector)
-                        
-                        # Upload to Pinecone
-                        self.pinecone_index.upsert(vectors=vectors)
-                        self.stats['uploaded_to_pinecone'] += len(vectors)
-                        uploaded_count += len(vectors)
-                        logger.info(f"✅ Batch {batch_idx + 1} uploaded successfully with inference API")
-                        
-                    except Exception as embed_error:
-                        logger.warning(f"⚠️ Inference API failed for batch {batch_idx + 1}: {embed_error}")
-                        
-                        # Method 2: Try using dummy embeddings (for testing/fallback)
+                        # Send records with 'text' so Pinecone computes embeddings using index embed config
+                        self.pinecone_index.upsert(records=records)
+                        self.stats['uploaded_to_pinecone'] += len(records)
+                        uploaded_count += len(records)
+                        logger.info(f"✅ Batch {batch_idx + 1} uploaded via server-side embedding (records)")
+                    except Exception as ingestion_error:
+                        logger.warning(f"⚠️ Records upsert failed (batch {batch_idx + 1}): {ingestion_error}")
+
+                        # Method 2: Client-side embedding via Pinecone Inference
                         try:
-                            import numpy as np
-                            
-                            vectors_dummy = []
-                            for record in records:
-                                # Create dummy 1536-dimensional vector (llama-text-embed-v2 dimension)
-                                dummy_values = np.random.normal(0, 1, 1536).tolist()
+                            texts = [record['chunk_text'] for record in records]
+                            embeddings_response = self.pinecone_client.inference.embed(
+                                model="llama-text-embed-v2",
+                                inputs=texts,
+                                parameters={"input_type": "passage"}
+                            )
+
+                            vectors = []
+                            for i, record in enumerate(records):
                                 vector = {
                                     'id': record['id'],
-                                    'values': dummy_values,
-                                    'metadata': {
-                                        **record['metadata'],
-                                        'chunk_text': record['chunk_text']
-                                    }
+                                    'values': embeddings_response.data[i].values,
+                                    # include chunk text in metadata since server-side mapping isn't used here
+                                    'metadata': {**record['metadata'], 'chunk_text': record['chunk_text']}
                                 }
-                                vectors_dummy.append(vector)
-                            
-                            self.pinecone_index.upsert(vectors=vectors_dummy)
-                            self.stats['uploaded_to_pinecone'] += len(vectors_dummy)
-                            uploaded_count += len(vectors_dummy)
-                            logger.info(f"✅ Batch {batch_idx + 1} uploaded with dummy embeddings (fallback)")
-                            
-                        except Exception as dummy_error:
-                            logger.error(f"❌ All methods failed for batch {batch_idx + 1}")
-                            logger.error(f"   Inference API error: {embed_error}")
-                            logger.error(f"   Dummy embedding error: {dummy_error}")
-                            # Continue to next batch instead of stopping
-                            continue
+                                vectors.append(vector)
+
+                            self.pinecone_index.upsert(vectors=vectors)
+                            self.stats['uploaded_to_pinecone'] += len(vectors)
+                            uploaded_count += len(vectors)
+                            logger.info(f"✅ Batch {batch_idx + 1} uploaded with client-side embeddings")
+
+                        except Exception as embed_error:
+                            logger.warning(f"⚠️ Inference API failed for batch {batch_idx + 1}: {embed_error}")
+
+                            # Method 3: Dummy embeddings fallback for testing
+                            try:
+                                import numpy as np
+
+                                vectors_dummy = []
+                                for record in records:
+                                    dummy_values = np.random.normal(0, 1, 1536).tolist()
+                                    vector = {
+                                        'id': record['id'],
+                                        'values': dummy_values,
+                                        'metadata': {**record['metadata'], 'chunk_text': record['chunk_text']}
+                                    }
+                                    vectors_dummy.append(vector)
+
+                                self.pinecone_index.upsert(vectors=vectors_dummy)
+                                self.stats['uploaded_to_pinecone'] += len(vectors_dummy)
+                                uploaded_count += len(vectors_dummy)
+                                logger.info(f"✅ Batch {batch_idx + 1} uploaded with dummy embeddings (fallback)")
+
+                            except Exception as dummy_error:
+                                logger.error(f"❌ All methods failed for batch {batch_idx + 1}")
+                                logger.error(f"   Records upsert error: {ingestion_error}")
+                                logger.error(f"   Inference API error: {embed_error}")
+                                logger.error(f"   Dummy embedding error: {dummy_error}")
+                                # Continue to next batch instead of stopping
+                                continue
                 else:
                     logger.warning(f"⚠️ Batch {batch_idx + 1} is empty, skipping...")
                 
