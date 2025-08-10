@@ -13,6 +13,7 @@ import hashlib
 from typing import List, Dict, Optional
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import importlib
 from pathlib import Path
 import logging
 
@@ -48,23 +49,23 @@ logger = logging.getLogger(__name__)
 class AdvancedPaperSearcher:
     def __init__(self):
         """Initialize dengan konfigurasi maksimal untuk RAG AI."""
-        
+
         # Directories
         self.base_dir = Path("rag_data")
         self.pdf_dir = self.base_dir / "pdfs"
         self.text_dir = self.base_dir / "extracted_texts"
         self.chunks_dir = self.base_dir / "text_chunks"
         self.checkpoint_dir = self.base_dir / "checkpoints"
-        
+
         # Create directories
         for dir_path in [self.pdf_dir, self.text_dir, self.chunks_dir, self.checkpoint_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Checkpoint files
         self.checkpoint_file = self.checkpoint_dir / "progress_checkpoint.json"
         self.papers_checkpoint_file = self.checkpoint_dir / "papers_checkpoint.json"
         self.chunks_checkpoint_file = self.checkpoint_dir / "chunks_checkpoint.json"
-        
+
         # API endpoints
         self.apis = {
             'semantic_scholar': "https://api.semanticscholar.org/graph/v1",
@@ -75,7 +76,7 @@ class AdvancedPaperSearcher:
             'openalex': "https://api.openalex.org/works",
             'ieee': "https://ieeexploreapi.ieee.org/api/v1/search/articles"
         }
-        
+
         # Search queries - comprehensive untuk containers vs microVMs
         self.search_queries = [
             "containers microVMs isolation security Firecracker Kata",
@@ -95,17 +96,18 @@ class AdvancedPaperSearcher:
             "edge computing containers microVMs",
             "cloud native security containers"
         ]
-        
+
         # Initialize tokenizer untuk chunking
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
-        
+
         # Simple sentence tokenizer (replaces NLTK)
         self.sentence_endings = r'[.!?]+\s+'
-        
+
         # Pinecone setup
         self.pinecone_client = None
         self.pinecone_index = None
-        
+        self._pymupdf_available = None  # detect once
+
         # Statistics tracking
         self.stats = {
             'papers_found': 0,
@@ -115,7 +117,7 @@ class AdvancedPaperSearcher:
             'uploaded_to_pinecone': 0,
             'errors': []
         }
-        
+
         # Progress tracking
         self.progress = {
             'current_step': 'initialized',
@@ -125,7 +127,7 @@ class AdvancedPaperSearcher:
             'current_chunk_index': 0,
             'last_saved_at': None
         }
-        
+
         logger.info("✅ AdvancedPaperSearcher v2 initialized!")
     
     def simple_sent_tokenize(self, text: str) -> List[str]:
@@ -759,7 +761,10 @@ class AdvancedPaperSearcher:
             logger.info(f"⬇️ Downloading: {paper.get('title', 'Unknown')[:50]}...")
             
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+                'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': paper.get('url', 'https://google.com')
             }
             
             response = requests.get(pdf_url, headers=headers, timeout=60, stream=True)
@@ -790,30 +795,39 @@ class AdvancedPaperSearcher:
     def _extract_text_from_pdf(self, filepath: Path) -> Optional[str]:
         """Extract text dari PDF."""
         try:
-            # Method 1: PyMuPDF (fitz)
+            # Method 1: PyMuPDF (fitz) if truly available
             try:
-                # Lazy import to avoid importing wrong 'fitz' package in some environments
-                import fitz  # PyMuPDF
-                doc = fitz.open(filepath)
-                text_parts = []
-                
-                for page_num in range(doc.page_count):
-                    page = doc[page_num]
-                    text = page.get_text()
-                    if text.strip():
-                        text_parts.append(text)
-                
-                doc.close()
-                
-                if text_parts:
-                    full_text = '\n\n'.join(text_parts)
-                    # Clean text
-                    full_text = re.sub(r'\n+', '\n', full_text)
-                    full_text = re.sub(r'\s+', ' ', full_text)
-                    return full_text.strip()
-                    
-            except Exception as e:
-                logger.warning(f"PyMuPDF unavailable or failed, falling back to PyPDF2: {e}")
+                if self._pymupdf_available is None:
+                    try:
+                        fitz = importlib.import_module('fitz')
+                        if not hasattr(fitz, 'open') or 'PyMuPDF' not in (getattr(fitz, '__doc__', '') or ''):
+                            raise ImportError('Imported fitz is not PyMuPDF')
+                        self._pymupdf_available = True
+                    except Exception:
+                        self._pymupdf_available = False
+
+                if self._pymupdf_available:
+                    fitz = importlib.import_module('fitz')
+                    doc = fitz.open(filepath)
+                    text_parts = []
+
+                    for page_num in range(doc.page_count):
+                        page = doc[page_num]
+                        text = page.get_text()
+                        if text and text.strip():
+                            text_parts.append(text)
+
+                    doc.close()
+
+                    if text_parts:
+                        full_text = '\n\n'.join(text_parts)
+                        # Clean text
+                        full_text = re.sub(r'\n+', '\n', full_text)
+                        full_text = re.sub(r'\s+', ' ', full_text)
+                        return full_text.strip()
+            except Exception:
+                # Quietly fall back to PyPDF2 without noisy warnings
+                pass
             
             # Method 2: PyPDF2 fallback
             with open(filepath, 'rb') as file:
@@ -1057,73 +1071,37 @@ class AdvancedPaperSearcher:
                     }
                     records.append(record)
                 
-                # Upload batch - try multiple approaches
+                # Upload batch - use client-side embeddings (more reliable)
                 if records:
                     logger.info(f"📤 Uploading batch {batch_idx + 1}/{end_batch} ({len(records)} records)...")
 
-                    # Method 1: Server-side embedding via records + field_map
                     try:
-                        # Send records with 'text' so Pinecone computes embeddings using index embed config
-                        self.pinecone_index.upsert(records=records)
-                        self.stats['uploaded_to_pinecone'] += len(records)
-                        uploaded_count += len(records)
-                        logger.info(f"✅ Batch {batch_idx + 1} uploaded via server-side embedding (records)")
-                    except Exception as ingestion_error:
-                        logger.warning(f"⚠️ Records upsert failed (batch {batch_idx + 1}): {ingestion_error}")
+                        texts = [record['chunk_text'] for record in records]
+                        embeddings_response = self.pinecone_client.inference.embed(
+                            model="llama-text-embed-v2",
+                            inputs=texts,
+                            parameters={"input_type": "passage"}
+                        )
 
-                        # Method 2: Client-side embedding via Pinecone Inference
-                        try:
-                            texts = [record['chunk_text'] for record in records]
-                            embeddings_response = self.pinecone_client.inference.embed(
-                                model="llama-text-embed-v2",
-                                inputs=texts,
-                                parameters={"input_type": "passage"}
-                            )
+                        vectors = []
+                        for i, record in enumerate(records):
+                            vector = {
+                                'id': record['id'],
+                                'values': embeddings_response.data[i].values,
+                                'metadata': {**record['metadata'], 'chunk_text': record['chunk_text']}
+                            }
+                            vectors.append(vector)
 
-                            vectors = []
-                            for i, record in enumerate(records):
-                                vector = {
-                                    'id': record['id'],
-                                    'values': embeddings_response.data[i].values,
-                                    # include chunk text in metadata since server-side mapping isn't used here
-                                    'metadata': {**record['metadata'], 'chunk_text': record['chunk_text']}
-                                }
-                                vectors.append(vector)
+                        self.pinecone_index.upsert(vectors=vectors)
+                        self.stats['uploaded_to_pinecone'] += len(vectors)
+                        uploaded_count += len(vectors)
+                        logger.info(f"✅ Batch {batch_idx + 1} uploaded with client-side embeddings")
 
-                            self.pinecone_index.upsert(vectors=vectors)
-                            self.stats['uploaded_to_pinecone'] += len(vectors)
-                            uploaded_count += len(vectors)
-                            logger.info(f"✅ Batch {batch_idx + 1} uploaded with client-side embeddings")
-
-                        except Exception as embed_error:
-                            logger.warning(f"⚠️ Inference API failed for batch {batch_idx + 1}: {embed_error}")
-
-                            # Method 3: Dummy embeddings fallback for testing
-                            try:
-                                import numpy as np
-
-                                vectors_dummy = []
-                                for record in records:
-                                    dummy_values = np.random.normal(0, 1, 1536).tolist()
-                                    vector = {
-                                        'id': record['id'],
-                                        'values': dummy_values,
-                                        'metadata': {**record['metadata'], 'chunk_text': record['chunk_text']}
-                                    }
-                                    vectors_dummy.append(vector)
-
-                                self.pinecone_index.upsert(vectors=vectors_dummy)
-                                self.stats['uploaded_to_pinecone'] += len(vectors_dummy)
-                                uploaded_count += len(vectors_dummy)
-                                logger.info(f"✅ Batch {batch_idx + 1} uploaded with dummy embeddings (fallback)")
-
-                            except Exception as dummy_error:
-                                logger.error(f"❌ All methods failed for batch {batch_idx + 1}")
-                                logger.error(f"   Records upsert error: {ingestion_error}")
-                                logger.error(f"   Inference API error: {embed_error}")
-                                logger.error(f"   Dummy embedding error: {dummy_error}")
-                                # Continue to next batch instead of stopping
-                                continue
+                    except Exception as embed_error:
+                        error_count += 1
+                        logger.error(f"❌ Vector upsert after embedding failed for batch {batch_idx + 1}: {embed_error}")
+                        self.stats['errors'].append(str(embed_error))
+                        continue
                 else:
                     logger.warning(f"⚠️ Batch {batch_idx + 1} is empty, skipping...")
                 
